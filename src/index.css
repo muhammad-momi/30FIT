@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-dark: #0d0f12;
+    --card-dark: #16191f;
+    --card-border: rgba(255, 255, 255, 0.08);
+    --accent-lime: #a3e635; /* electric lime */
+    --accent-lime-glow: rgba(163, 230, 53, 0.25);
+    --text-primary: #f9fafb;
+    --text-muted: #9ca3af;
+    --color-recovery: #38bdf8;
+    --color-progress: #22c55e;
+    --color-warning: #f59e0b;
+  }
+
+  body {
+    background-color: var(--bg-dark);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    margin: 0;
+    padding: 0;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
