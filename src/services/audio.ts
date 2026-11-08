@@ -144,3 +144,62 @@ class SoundEngine {
 }
 
 export const soundEngine = new SoundEngine();
+
+// Browser speech synthesis for offline hands-free workout coaching
+class SpeechEngine {
+  private enabled: boolean = true;
+
+  public setEnabled(enabled: boolean) {
+    this.enabled = enabled;
+    if (!enabled) {
+      this.stop();
+    }
+  }
+
+  public isVoiceSupported(): boolean {
+    return typeof window !== 'undefined' && 'speechSynthesis' in window;
+  }
+
+  public speak(text: string) {
+    if (!this.enabled || !this.isVoiceSupported()) return;
+
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.05;
+      utterance.pitch = 1.0;
+      utterance.volume = 0.95;
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      // SpeechSynthesis failure fallback
+    }
+  }
+
+  public stop() {
+    if (this.isVoiceSupported()) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // Ignore failure
+      }
+    }
+  }
+
+  public announceExercise(exerciseName: string, targetRepsOrDuration: number, unit: 'reps' | 'seconds', durationSeconds: number) {
+    const targetText = unit === 'reps'
+      ? `${targetRepsOrDuration} repetitions`
+      : `${targetRepsOrDuration} seconds`;
+    this.speak(`${exerciseName}. ${targetText}. ${durationSeconds} seconds.`);
+  }
+
+  public announceRest(restSeconds: number) {
+    this.speak(`Rest. ${restSeconds} seconds.`);
+  }
+
+  public announceNextUpcoming(_nextName?: string) {
+    this.speak(`Next set starting in three, two, one.`);
+  }
+}
+
+export const speechEngine = new SpeechEngine();
+

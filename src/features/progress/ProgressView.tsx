@@ -13,6 +13,7 @@ import { SvgBarChart } from '../../components/charts/SvgBarChart';
 import { SvgLineChart } from '../../components/charts/SvgLineChart';
 import { ConsistencyHeatmap } from '../../components/charts/ConsistencyHeatmap';
 import { db } from '../../services/db';
+import { calculateStreak, formatLocalDate } from '../../services/progression';
 
 interface ProgressViewProps {
   sessions: WorkoutSession[];
@@ -65,25 +66,11 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
   const overallPercentage = Math.round((totalCompletedDays / trainingDaysCount) * 100);
 
   // Compute streaks
-  let currentStreak = 0;
-  let bestStreak = 0;
-  let tempStreak = 0;
-
-  for (let d = 1; d <= 30; d++) {
-    const day = WORKOUT_DAYS.find(w => w.dayNumber === d);
-    if (!day) continue;
-
-    if (completedDayNumbers.has(d)) {
-      tempStreak++;
-      if (tempStreak > bestStreak) bestStreak = tempStreak;
-      if (d <= currentDay) currentStreak = tempStreak;
-    } else if (day.isRecovery) {
-      continue;
-    } else if (d < currentDay) {
-      tempStreak = 0;
-      currentStreak = 0;
-    }
-  }
+  const { currentStreak, bestStreak } = calculateStreak(
+    sessions,
+    formatLocalDate(),
+    settings.bestStreak
+  );
 
   // Chart Data: Reps per session
   const repsPerSessionData = sessions

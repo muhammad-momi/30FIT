@@ -37,6 +37,14 @@ export const ExerciseAnimator: React.FC<ExerciseAnimatorProps> = ({
   const animationDuration = `${2 / currentSpeed}s`;
   const playState = isPlaying ? 'running' : 'paused';
 
+  if (!exercise) {
+    return (
+      <div className={`relative flex flex-col items-center justify-center rounded-2xl bg-[#12151b] border border-white/10 p-6 text-center text-white/50 ${className}`}>
+        <span className="text-xs font-semibold">Demonstration preview</span>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`relative flex flex-col items-center justify-center rounded-2xl bg-[#12151b] border border-white/10 overflow-hidden shadow-2xl transition-all ${
@@ -47,9 +55,9 @@ export const ExerciseAnimator: React.FC<ExerciseAnimatorProps> = ({
       <div className="absolute top-3 left-3 right-3 flex items-center justify-between z-10 pointer-events-none">
         <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/60 border border-white/10 text-xs font-medium text-white/80 backdrop-blur-md">
           <span className="w-2 h-2 rounded-full bg-[#a3e635] animate-pulse" />
-          <span>{exercise.category}</span>
+          <span>{exercise.category || 'Full Body'}</span>
           <span className="text-white/40">•</span>
-          <span className="text-[#a3e635]">{exercise.primaryMuscles.join(', ')}</span>
+          <span className="text-[#a3e635]">{(exercise.primaryMuscles || ['Muscles']).join(', ')}</span>
         </div>
 
         <div className="flex items-center gap-1 pointer-events-auto">

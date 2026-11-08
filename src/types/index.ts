@@ -155,14 +155,63 @@ export interface UserSettings {
   challengeStartDate: string; // YYYY-MM-DD
   defaultRestDuration: number; // seconds
   soundEnabled: boolean;
+  voiceEnabled: boolean;
   vibrationEnabled: boolean;
   wakeLockEnabled: boolean;
   reducedMotion: boolean;
   animationSpeed: number; // 0.5, 1, 1.5
+  repPaceMultiplier?: number;
   morningReminderEnabled: boolean;
   morningReminderTime: string; // '07:30'
   eveningReminderEnabled: boolean;
   eveningReminderTime: string; // '18:30'
   installedPwaPromptDismissed: boolean;
   completedMorningDays: number[]; // day numbers where morning routine was marked done
+  nextPendingDay: number;
+  currentStreak: number;
+  bestStreak: number;
+  missedDays: string[];
+  lastProcessedDate: string;
+}
+
+export type ExerciseStatus = 'not_started' | 'in_progress' | 'completed';
+
+export interface ExerciseWorkoutStatus {
+  exerciseId: string;
+  status: ExerciseStatus;
+  completedSets: number;
+  totalSets: number;
+}
+
+export type PlayerState = 'IDLE' | 'PREPARING' | 'EXERCISING' | 'RESTING' | 'PAUSED' | 'COMPLETED';
+
+export interface WorkoutTimelineItem {
+  id: string;
+  exerciseId: string;
+  exerciseName: string;
+  setNumber: number;
+  totalSets: number;
+  target: number;
+  unit: 'reps' | 'seconds';
+  duration: number; // calculated seconds
+  phase: 'warmup' | 'main' | 'cooldown';
+  restDuration: number;
+  targetNote?: string;
+  nextPreview: {
+    name: string;
+    detail: string;
+  } | null;
+}
+
+export interface SavedWorkoutState {
+  dayNumber: number;
+  timelineIndex: number;
+  state: PlayerState;
+  remainingSeconds: number;
+  restRemainingSeconds: number;
+  totalSeconds: number;
+  activeSeconds: number;
+  restSeconds: number;
+  completedTimelineIndices: number[];
+  lastSavedAt: number;
 }

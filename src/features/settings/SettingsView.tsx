@@ -331,6 +331,51 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             />
           </div>
 
+          {/* Voice Coach Announcements Toggle */}
+          <div className="flex items-center justify-between p-3 rounded-2xl bg-white/5">
+            <div className="flex items-center gap-2.5">
+              <Volume2 size={16} className={settings.voiceEnabled ? 'text-[#a3e635]' : 'text-white/40'} />
+              <div>
+                <span className="font-semibold text-white">Voice Coach Announcements</span>
+                <p className="text-[11px] text-white/50">Hands-free voice cues for exercise start, rest countdowns, and completion (offline speech synthesis)</p>
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={settings.voiceEnabled ?? true}
+              onChange={e => handleUpdate({ voiceEnabled: e.target.checked })}
+              className="w-4 h-4 accent-[#a3e635] cursor-pointer"
+            />
+          </div>
+
+          {/* Repetition Pace Multiplier Selector */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 rounded-2xl bg-white/5">
+            <div>
+              <span className="font-semibold text-white">Exercise Repetition Pacing</span>
+              <p className="text-[11px] text-white/50">Adjusts countdown timer pace for rep exercises without changing target repetitions</p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {[
+                { label: 'Fast (0.8x)', val: 0.8 },
+                { label: 'Normal (1.0x)', val: 1.0 },
+                { label: 'Relaxed (1.25x)', val: 1.25 },
+                { label: 'Slow (1.5x)', val: 1.5 }
+              ].map(opt => (
+                <button
+                  key={opt.val}
+                  onClick={() => handleUpdate({ repPaceMultiplier: opt.val })}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition ${
+                    (settings.repPaceMultiplier || 1.0) === opt.val
+                      ? 'bg-[#a3e635] text-black font-bold'
+                      : 'bg-white/5 text-white/70 hover:text-white'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           {/* Vibration Toggle */}
           <div className="flex items-center justify-between p-3 rounded-2xl bg-white/5">
             <div className="flex items-center gap-2.5">

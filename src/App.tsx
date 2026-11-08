@@ -8,8 +8,10 @@ import { LibraryView } from './features/exercise-library/LibraryView';
 import { ProgressView } from './features/progress/ProgressView';
 import { AssessmentsView } from './features/assessments/AssessmentsView';
 import { SettingsView } from './features/settings/SettingsView';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { getUserSettings, db, DEFAULT_SETTINGS, updateUserSettings } from './services/db';
-import { getCurrentChallengeDay, WORKOUT_DAYS } from './data/program';
+import { WORKOUT_DAYS } from './data/program';
+import { getCurrentPendingDay } from './services/progression';
 import type { UserSettings, WorkoutSession } from './types';
 
 export function App() {
@@ -29,8 +31,8 @@ export function App() {
       const allSessions = await db.sessions.toArray();
       setSessions(allSessions);
 
-      const day = getCurrentChallengeDay(userSettings.challengeStartDate);
-      setActiveWorkoutDay(day);
+      const pendingDay = getCurrentPendingDay(allSessions, userSettings);
+      setActiveWorkoutDay(pendingDay);
       setIsLoaded(true);
     } catch (err) {
       console.error('Failed to load initial data:', err);
@@ -42,7 +44,8 @@ export function App() {
     loadAppData();
   }, [loadAppData]);
 
-  const currentChallengeDay = getCurrentChallengeDay(settings.challengeStartDate);
+  // Completion-based pending programme day
+  const currentPendingDay = getCurrentPendingDay(sessions, settings);
 
   // Compute overall progress
   const completedEveningSessions = sessions.filter(s => s.isCompleted && s.sessionType === 'evening');
@@ -50,7 +53,7 @@ export function App() {
   const trainingDaysCount = WORKOUT_DAYS.filter(d => !d.isRecovery).length;
   const overallProgress = Math.round((completedDayNumbers.size / trainingDaysCount) * 100);
 
-  // Launch Workout
+  // Launch Workout (starts hands-free automatic player)
   const handleStartWorkout = (dayNumber: number) => {
     setActiveWorkoutDay(dayNumber);
     setIsWorkoutActive(true);
@@ -62,7 +65,7 @@ export function App() {
   const handleFinishWorkout = async (_session: WorkoutSession) => {
     setIsWorkoutActive(false);
     await loadAppData();
-    setCurrentTab('progress');
+    setCurrentTab('dashboard');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -96,46 +99,57 @@ export function App() {
     );
   }
 
+  const isFullWorkoutScreen = currentTab === 'workout' && isWorkoutActive;
+
   return (
     <div className="min-h-screen bg-[#0d0f12] text-white flex flex-col lg:flex-row antialiased">
-      {/* Navigation (Sidebar on Desktop, Bottom bar on Mobile) */}
-      <Navigation
-        currentTab={currentTab}
-        onTabChange={(tab) => {
-          if (tab === 'workout' && !isWorkoutActive) {
-            handleStartWorkout(currentChallengeDay);
-          } else {
-            setCurrentTab(tab);
-          }
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        }}
-        currentDay={currentChallengeDay}
-        overallProgress={overallProgress}
-        isWorkoutActive={isWorkoutActive}
-      />
+      {/* Navigation (Sidebar on Desktop, Bottom bar on Mobile - hidden during active full-screen workout) */}
+      {!isFullWorkoutScreen && (
+        <Navigation
+          currentTab={currentTab}
+          onTabChange={(tab) => {
+            if (tab === 'workout') {
+              handleStartWorkout(currentPendingDay);
+            } else {
+              setCurrentTab(tab);
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }}
+          currentDay={currentPendingDay}
+          overallProgress={overallProgress}
+          isWorkoutActive={isWorkoutActive}
+        />
+      )}
 
       {/* Main Content Area */}
-      <main className="flex-1 w-full min-h-screen px-4 sm:px-6 lg:px-8 pt-4 pb-28 lg:pb-8 max-w-7xl mx-auto">
+      <main
+        className={`flex-1 w-full min-h-screen ${
+          isFullWorkoutScreen
+            ? 'p-0 max-w-none'
+            : 'px-4 sm:px-6 lg:px-8 pt-4 pb-28 lg:pb-8 max-w-7xl mx-auto'
+        }`}
+      >
         {currentTab === 'dashboard' && (
           <DashboardView
-            currentDay={currentChallengeDay}
+            currentDay={currentPendingDay}
             settings={settings}
             sessions={sessions}
             onStartWorkout={handleStartWorkout}
             onNavigate={(tab) => {
               if (tab === 'workout') {
-                handleStartWorkout(currentChallengeDay);
+                handleStartWorkout(currentPendingDay);
               } else {
                 setCurrentTab(tab);
               }
             }}
             onToggleMorningDay={handleToggleMorningDay}
+            onRefreshData={loadAppData}
           />
         )}
 
         {currentTab === 'calendar' && (
           <CalendarView
-            currentDay={currentChallengeDay}
+            currentDay={currentPendingDay}
             settings={settings}
             sessions={sessions}
             onStartWorkout={handleStartWorkout}
@@ -143,12 +157,19 @@ export function App() {
         )}
 
         {currentTab === 'workout' && (
-          <WorkoutView
-            dayNumber={activeWorkoutDay}
-            settings={settings}
-            onFinishWorkout={handleFinishWorkout}
-            onExit={handleExitWorkout}
-          />
+          <ErrorBoundary
+            fallbackTitle="UNABLE TO RESUME WORKOUT"
+            onReset={() => {
+              loadAppData();
+            }}
+          >
+            <WorkoutView
+              dayNumber={activeWorkoutDay}
+              settings={settings}
+              onFinishWorkout={handleFinishWorkout}
+              onExit={handleExitWorkout}
+            />
+          </ErrorBoundary>
         )}
 
         {currentTab === 'library' && <LibraryView />}
@@ -157,14 +178,14 @@ export function App() {
           <ProgressView
             sessions={sessions}
             settings={settings}
-            currentDay={currentChallengeDay}
+            currentDay={currentPendingDay}
             onRefreshSessions={loadAppData}
           />
         )}
 
         {currentTab === 'assessments' && (
           <AssessmentsView
-            currentDay={currentChallengeDay}
+            currentDay={currentPendingDay}
             settings={settings}
           />
         )}
@@ -183,3 +204,4 @@ export function App() {
 }
 
 export default App;
+

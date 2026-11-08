@@ -1,33 +1,47 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import confetti from 'canvas-confetti';
 import {
   Play,
   Pause,
-  SkipForward,
-  RotateCcw,
-  CheckCircle,
-  Clock,
   Award,
-  X,
-  HelpCircle,
+  Volume2,
+  VolumeX,
+  Maximize2,
+  Minimize2,
+  Sparkles,
+  ArrowLeft,
+  CheckCircle2,
   Plus,
-  Minus
+  Heart,
+  AlertTriangle,
+  RotateCcw
 } from 'lucide-react';
 import type {
-  WorkoutSetRecord,
-  ExerciseSessionRecord,
   WorkoutSession,
   UserSettings,
-  ScheduledExercise
+  WorkoutTimelineItem,
+  PlayerState,
+  SavedWorkoutState,
+  ExerciseSessionRecord
 } from '../../types';
 import { WORKOUT_DAYS } from '../../data/program';
 import { EXERCISES } from '../../data/exercises';
 import { ExerciseAnimator } from '../../components/animations/ExerciseAnimator';
-import { ProgressRing } from '../../components/common/ProgressRing';
-import { soundEngine } from '../../services/audio';
+import { soundEngine, speechEngine } from '../../services/audio';
 import { triggerHaptic } from '../../services/vibrate';
 import { wakeLockService } from '../../services/wakeLock';
-import { db } from '../../services/db';
+import { db, updateUserSettings } from '../../services/db';
+import { buildWorkoutTimeline } from '../../services/workoutEngine';
+import {
+  formatLocalDate,
+  advanceProgramDay,
+  calculateStreak
+} from '../../services/progression';
+import {
+  normalizeSavedSession,
+  getSafeExercise,
+  type NormalizedSavedSession
+} from '../../services/sessionRestoration';
 
 interface WorkoutViewProps {
   dayNumber: number;
@@ -42,137 +56,114 @@ export const WorkoutView: React.FC<WorkoutViewProps> = ({
   onFinishWorkout,
   onExit
 }) => {
-  const workoutDay = WORKOUT_DAYS.find(d => d.dayNumber === dayNumber) || WORKOUT_DAYS[0];
+  const workoutDay = useMemo(() => {
+    return WORKOUT_DAYS.find(d => d.dayNumber === dayNumber) || WORKOUT_DAYS[0];
+  }, [dayNumber]);
 
-  // Workout Phases: 'warmup' | 'main' | 'cooldown'
-  const [currentPhase, setCurrentPhase] = useState<'warmup' | 'main' | 'cooldown'>(
-    workoutDay.warmupExercises.length > 0 ? 'warmup' : 'main'
-  );
+  // Pre-build the entire workout timeline before playback
+  const timeline: WorkoutTimelineItem[] = useMemo(() => {
+    if (workoutDay.isRecovery) return [];
+    return buildWorkoutTimeline(
+      workoutDay,
+      settings.defaultRestDuration,
+      settings.repPaceMultiplier || 1.0
+    );
+  }, [workoutDay, settings.defaultRestDuration, settings.repPaceMultiplier]);
 
-  // Active exercises based on current phase
-  const activeExerciseList: ScheduledExercise[] =
-    currentPhase === 'warmup'
-      ? workoutDay.warmupExercises
-      : currentPhase === 'cooldown'
-      ? workoutDay.cooldownExercises
-      : workoutDay.mainExercises;
+  // State machine: IDLE | PREPARING | EXERCISING | RESTING | PAUSED | COMPLETED
+  const [playerState, setPlayerState] = useState<PlayerState>('IDLE');
+  const [timelineIndex, setTimelineIndex] = useState<number>(0);
 
-  const [exerciseIndex, setExerciseIndex] = useState<number>(0);
-  const [currentSetIndex, setCurrentSetIndex] = useState<number>(0);
-
-  // Sets record state per exercise: { [exerciseId]: WorkoutSetRecord[] }
-  const [recordedSets, setRecordedSets] = useState<Record<string, WorkoutSetRecord[]>>(() => {
-    const initial: Record<string, WorkoutSetRecord[]> = {};
-    const all = [...workoutDay.warmupExercises, ...workoutDay.mainExercises, ...workoutDay.cooldownExercises];
-    all.forEach(sched => {
-      if (!initial[sched.exerciseId]) {
-        initial[sched.exerciseId] = Array.from({ length: sched.sets }, (_, i) => ({
-          setNumber: i + 1,
-          target: sched.repsOrDuration,
-          actual: sched.repsOrDuration,
-          completed: false,
-          skipped: false
-        }));
-      }
-    });
-    return initial;
-  });
-
-  // Current rep or duration input adjuster for active set
-  const currentSched = activeExerciseList[exerciseIndex] || workoutDay.mainExercises[0];
-  const currentEx = EXERCISES[currentSched?.exerciseId] || EXERCISES['push-ups'];
-  const [activeValue, setActiveValue] = useState<number>(() => currentSched?.repsOrDuration || 10);
-
-  // Global Stopwatch & Active State
-  const [isPaused, setIsPaused] = useState<boolean>(false);
+  // Timers and stopwatch
+  const [timerRemaining, setTimerRemaining] = useState<number>(0);
+  const [restRemaining, setRestRemaining] = useState<number>(0);
+  const [prepareRemaining, setPrepareRemaining] = useState<number>(3);
   const [totalSeconds, setTotalSeconds] = useState<number>(0);
   const [activeSeconds, setActiveSeconds] = useState<number>(0);
   const [restSeconds, setRestSeconds] = useState<number>(0);
 
-  // Rest Timer State (Reliable absolute timestamp target)
-  const [isResting, setIsResting] = useState<boolean>(false);
-  const [restDuration, setRestDuration] = useState<number>(currentSched?.restDuration || settings.defaultRestDuration);
-  const [restRemaining, setRestRemaining] = useState<number>(0);
-  const restTargetTimestampRef = useRef<number | null>(null);
+  // Saved / paused workout in local storage
+  const [savedWorkout, setSavedWorkout] = useState<NormalizedSavedSession | null>(null);
 
-  // Timed Exercise Countdown (Plank, holds, high knees)
-  const [isExerciseTimerRunning, setIsExerciseTimerRunning] = useState<boolean>(false);
-  const [exerciseTimerRemaining, setExerciseTimerRemaining] = useState<number>(currentSched?.repsOrDuration || 30);
-  const exerciseTimerTargetRef = useRef<number | null>(null);
+  // Sound and Voice toggles
+  const [soundOn, setSoundOn] = useState<boolean>(settings.soundEnabled);
+  const [voiceOn, setVoiceOn] = useState<boolean>(settings.voiceEnabled);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [completedIndices, setCompletedIndices] = useState<Set<number>>(() => new Set());
 
-  // Dialog States
-  const [showExitConfirm, setShowExitConfirm] = useState<boolean>(false);
-  const [showCompletionModal, setShowCompletionModal] = useState<boolean>(false);
-  const [showInstructionModal, setShowInstructionModal] = useState<boolean>(false);
+  // High-accuracy timestamp references to prevent drift & survive backgrounding
+  const targetEndTimeRef = useRef<number | null>(null);
+  const lastTickTimeRef = useRef<number>(0);
 
-  // Screen Wake Lock & Sound config
+  // Current timeline item
+  const currentItem: WorkoutTimelineItem | undefined = timeline[timelineIndex];
+  const currentEx = currentItem ? getSafeExercise(currentItem.exerciseId) : undefined;
+
+  // Next item preview
+  const nextItem: WorkoutTimelineItem | undefined = timeline[timelineIndex + 1];
+
+  // Initialize audio and wake lock
   useEffect(() => {
-    wakeLockService.setEnabled(settings.wakeLockEnabled);
-    wakeLockService.request();
-    soundEngine.setEnabled(settings.soundEnabled);
+    soundEngine.setEnabled(soundOn);
+    speechEngine.setEnabled(voiceOn);
+  }, [soundOn, voiceOn]);
 
+  useEffect(() => {
+    if (playerState === 'EXERCISING' || playerState === 'RESTING' || playerState === 'PREPARING') {
+      wakeLockService.setEnabled(settings.wakeLockEnabled);
+      wakeLockService.request();
+    } else {
+      wakeLockService.release();
+    }
     return () => {
       wakeLockService.release();
     };
-  }, [settings]);
+  }, [playerState, settings.wakeLockEnabled]);
 
-  // Update activeValue when switching exercise
+  // Check for any existing paused workout in IndexedDB on mount & normalize safely
   useEffect(() => {
-    if (currentSched) {
-      const existingSets = recordedSets[currentSched.exerciseId];
-      const target = existingSets?.[currentSetIndex]?.target || currentSched.repsOrDuration;
-      setActiveValue(target);
-
-      // Reset exercise timer state
-      if (currentEx.isTimed) {
-        setExerciseTimerRemaining(target);
-        setIsExerciseTimerRunning(false);
-        exerciseTimerTargetRef.current = null;
+    let isMounted = true;
+    async function checkSaved() {
+      try {
+        const saved = await db.activeWorkout.get('current');
+        if (isMounted && saved && saved.state) {
+          const normalized = normalizeSavedSession(saved.state, timeline, dayNumber);
+          if (normalized && normalized.dayNumber === dayNumber) {
+            setSavedWorkout(normalized);
+          }
+        }
+      } catch (err) {
+        console.error('Error loading active workout state:', err);
       }
     }
-  }, [exerciseIndex, currentSetIndex, currentPhase, currentSched, currentEx.isTimed, recordedSets]);
+    checkSaved();
+    return () => {
+      isMounted = false;
+    };
+  }, [dayNumber, timeline]);
 
-  // Start Rest Timer
-  const triggerRestTimer = useCallback((duration: number) => {
-    setIsResting(true);
-    setRestDuration(duration);
-    setRestRemaining(duration);
-    restTargetTimestampRef.current = Date.now() + duration * 1000;
-  }, []);
-
-  const skipRest = () => {
-    setIsResting(false);
-    restTargetTimestampRef.current = null;
-    setRestRemaining(0);
+  // Format MM:SS helper
+  const formatTime = (secs: number): string => {
+    const s = Math.max(0, Math.floor(secs));
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    return `${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
   };
 
-  const addRestTime = (secondsToAdd: number) => {
-    if (restTargetTimestampRef.current !== null) {
-      restTargetTimestampRef.current += secondsToAdd * 1000;
-      setRestRemaining(prev => prev + secondsToAdd);
-    }
-  };
-
-  // Timed exercise controls
-  const startExerciseTimer = () => {
-    setIsExerciseTimerRunning(true);
-    exerciseTimerTargetRef.current = Date.now() + exerciseTimerRemaining * 1000;
-  };
-
-  const pauseExerciseTimer = () => {
-    setIsExerciseTimerRunning(false);
-    exerciseTimerTargetRef.current = null;
-  };
-
-  // Celebrate and finish
-  const finishAndCelebrate = useCallback(() => {
+  // =========================================================================
+  // AUTOMATIC COMPLETION
+  // =========================================================================
+  const handleWorkoutComplete = useCallback(async () => {
+    setPlayerState('COMPLETED');
+    targetEndTimeRef.current = null;
+    speechEngine.stop();
     soundEngine.playWorkoutComplete();
     triggerHaptic([100, 80, 150, 100, 300], settings.vibrationEnabled);
 
     try {
       confetti({
-        particleCount: 100,
-        spread: 70,
+        particleCount: 120,
+        spread: 80,
         origin: { y: 0.6 },
         colors: ['#a3e635', '#22c55e', '#ffffff', '#38bdf8']
       });
@@ -180,699 +171,921 @@ export const WorkoutView: React.FC<WorkoutViewProps> = ({
       // Ignore confetti error
     }
 
-    setShowCompletionModal(true);
-  }, [settings.vibrationEnabled]);
-
-  // Handle phase transitions (warmup -> main -> cooldown -> finished)
-  const handlePhaseTransition = useCallback(() => {
-    setIsResting(false);
-    if (currentPhase === 'warmup') {
-      setCurrentPhase('main');
-      setExerciseIndex(0);
-      setCurrentSetIndex(0);
-    } else if (currentPhase === 'main') {
-      if (workoutDay.cooldownExercises.length > 0) {
-        setCurrentPhase('cooldown');
-        setExerciseIndex(0);
-        setCurrentSetIndex(0);
-      } else {
-        finishAndCelebrate();
-      }
-    } else {
-      finishAndCelebrate();
-    }
-  }, [currentPhase, workoutDay.cooldownExercises.length, finishAndCelebrate]);
-
-  // Complete a Set
-  const handleCompleteSet = useCallback((actualRepsOrDuration?: number) => {
-    const valueToRecord = actualRepsOrDuration !== undefined ? actualRepsOrDuration : activeValue;
-    const exId = currentSched.exerciseId;
-
-    setRecordedSets(prev => {
-      const existing = prev[exId] ? [...prev[exId]] : [];
-      if (existing[currentSetIndex]) {
-        existing[currentSetIndex] = {
-          ...existing[currentSetIndex],
-          actual: valueToRecord,
-          completed: true,
-          skipped: false
-        };
-      }
-      return { ...prev, [exId]: existing };
-    });
-
-    soundEngine.playFinish();
-    triggerHaptic(50, settings.vibrationEnabled);
-
-    // If more sets remain in this exercise
-    if (currentSetIndex < currentSched.sets - 1) {
-      setCurrentSetIndex(prev => prev + 1);
-      triggerRestTimer(currentSched.restDuration || settings.defaultRestDuration);
-    } else {
-      // Completed all sets for this exercise!
-      if (exerciseIndex < activeExerciseList.length - 1) {
-        setExerciseIndex(prev => prev + 1);
-        setCurrentSetIndex(0);
-        triggerRestTimer(currentSched.restDuration || settings.defaultRestDuration);
-      } else {
-        handlePhaseTransition();
-      }
-    }
-  }, [
-    activeValue,
-    currentSched,
-    currentSetIndex,
-    exerciseIndex,
-    activeExerciseList.length,
-    settings.defaultRestDuration,
-    settings.vibrationEnabled,
-    triggerRestTimer,
-    handlePhaseTransition
-  ]);
-
-  // Master Clock Loop (Uses performance.now / Date.now absolute target calculations)
-  useEffect(() => {
-    const timer = setInterval(() => {
-      if (isPaused) return;
-
-      setTotalSeconds(prev => prev + 1);
-
-      // Handle Rest Timer
-      if (isResting && restTargetTimestampRef.current !== null) {
-        const remaining = Math.max(0, Math.ceil((restTargetTimestampRef.current - Date.now()) / 1000));
-        setRestRemaining(remaining);
-        setRestSeconds(prev => prev + 1);
-
-        if (remaining <= 3 && remaining > 0) {
-          soundEngine.playTick();
-        }
-
-        if (remaining <= 0) {
-          setIsResting(false);
-          restTargetTimestampRef.current = null;
-          soundEngine.playRestComplete();
-          triggerHaptic([100, 50, 100], settings.vibrationEnabled);
-        }
-      } else {
-        setActiveSeconds(prev => prev + 1);
-      }
-
-      // Handle Timed Exercise Countdown
-      if (isExerciseTimerRunning && exerciseTimerTargetRef.current !== null) {
-        const remaining = Math.max(0, Math.ceil((exerciseTimerTargetRef.current - Date.now()) / 1000));
-        setExerciseTimerRemaining(remaining);
-
-        if (remaining <= 3 && remaining > 0) {
-          soundEngine.playTick();
-        }
-
-        if (remaining <= 0) {
-          setIsExerciseTimerRunning(false);
-          exerciseTimerTargetRef.current = null;
-          soundEngine.playFinish();
-          triggerHaptic(200, settings.vibrationEnabled);
-          handleCompleteSet(currentSched.repsOrDuration);
-        }
-      }
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [isPaused, isResting, isExerciseTimerRunning, currentSched, settings, handleCompleteSet]);
-
-  // Undo Last Set
-  const handleUndoSet = () => {
-    const exId = currentSched.exerciseId;
-    if (currentSetIndex > 0) {
-      const targetSetIdx = currentSetIndex - 1;
-      setRecordedSets(prev => {
-        const existing = [...prev[exId]];
-        if (existing[targetSetIdx]) {
-          existing[targetSetIdx].completed = false;
-        }
-        return { ...prev, [exId]: existing };
-      });
-      setCurrentSetIndex(targetSetIdx);
-      setIsResting(false);
-    } else if (exerciseIndex > 0) {
-      const prevExIdx = exerciseIndex - 1;
-      const prevSched = activeExerciseList[prevExIdx];
-      setExerciseIndex(prevExIdx);
-      setCurrentSetIndex(prevSched.sets - 1);
-      setIsResting(false);
-    }
-  };
-
-  // Skip Exercise
-  const handleSkipExercise = () => {
-    const exId = currentSched.exerciseId;
-    setRecordedSets(prev => {
-      const existing = prev[exId] ? [...prev[exId]] : [];
-      return {
-        ...prev,
-        [exId]: existing.map(s => ({ ...s, skipped: true, completed: false }))
-      };
-    });
-
-    if (exerciseIndex < activeExerciseList.length - 1) {
-      setExerciseIndex(prev => prev + 1);
-      setCurrentSetIndex(0);
-      setIsResting(false);
-    } else {
-      handlePhaseTransition();
-    }
-  };
-
-  // Save session record to Dexie
-  const handleSaveAndExit = async (isFullComplete: boolean) => {
+    // Build session exercises record
     const sessionExercises: ExerciseSessionRecord[] = workoutDay.mainExercises.map(sched => {
-      const sets = recordedSets[sched.exerciseId] || [];
       const ex = EXERCISES[sched.exerciseId];
       return {
         exerciseId: sched.exerciseId,
         exerciseName: ex ? ex.name : sched.exerciseId,
-        sets: sets,
-        skipped: sets.every(s => s.skipped)
+        sets: Array.from({ length: sched.sets }, (_, i) => ({
+          setNumber: i + 1,
+          target: sched.repsOrDuration,
+          actual: sched.repsOrDuration,
+          completed: true,
+          skipped: false
+        })),
+        skipped: false
       };
     });
 
     const now = new Date();
+    const todayStr = formatLocalDate(now);
     const session: WorkoutSession = {
       dayNumber: workoutDay.dayNumber,
-      dateCompleted: now.toISOString().split('T')[0],
+      dateCompleted: todayStr,
       startedAt: new Date(Date.now() - totalSeconds * 1000).toISOString(),
       finishedAt: now.toISOString(),
-      totalDurationSeconds: totalSeconds,
+      totalDurationSeconds: Math.max(60, totalSeconds),
       activeDurationSeconds: activeSeconds,
       restDurationSeconds: restSeconds,
-      isCompleted: isFullComplete,
+      isCompleted: true,
+      sessionType: 'evening',
       exercises: sessionExercises,
-      sessionType: 'evening'
+      notes: 'Completed automatically hands-free'
+    };
+
+    try {
+      // Save session to IndexedDB
+      await db.sessions.add(session);
+      // Clear paused session from activeWorkout table
+      await db.activeWorkout.delete('current');
+
+      // Advance programme by exactly one day
+      const nextDay = advanceProgramDay(workoutDay.dayNumber, settings.nextPendingDay);
+      const allSessions = await db.sessions.toArray();
+      const streakInfo = calculateStreak(allSessions, todayStr, settings.bestStreak);
+
+      await updateUserSettings({
+        nextPendingDay: nextDay,
+        currentStreak: streakInfo.currentStreak,
+        bestStreak: streakInfo.bestStreak
+      });
+    } catch (err) {
+      console.error('Failed to save completed workout:', err);
+    }
+  }, [
+    workoutDay,
+    totalSeconds,
+    activeSeconds,
+    restSeconds,
+    settings.vibrationEnabled,
+    settings.nextPendingDay,
+    settings.bestStreak
+  ]);
+
+  // Handle Recovery Day 1-click completion
+  const handleCompleteRecoveryDay = async () => {
+    soundEngine.playWorkoutComplete();
+    const now = new Date();
+    const todayStr = formatLocalDate(now);
+
+    const session: WorkoutSession = {
+      dayNumber: workoutDay.dayNumber,
+      dateCompleted: todayStr,
+      startedAt: now.toISOString(),
+      finishedAt: now.toISOString(),
+      totalDurationSeconds: 1200,
+      activeDurationSeconds: 1200,
+      restDurationSeconds: 0,
+      isCompleted: true,
+      sessionType: 'evening',
+      exercises: [],
+      notes: 'Observed scheduled recovery day'
     };
 
     try {
       await db.sessions.add(session);
+      await db.activeWorkout.delete('current');
+
+      const nextDay = advanceProgramDay(workoutDay.dayNumber, settings.nextPendingDay);
+      const allSessions = await db.sessions.toArray();
+      const streakInfo = calculateStreak(allSessions, todayStr, settings.bestStreak);
+
+      await updateUserSettings({
+        nextPendingDay: nextDay,
+        currentStreak: streakInfo.currentStreak,
+        bestStreak: streakInfo.bestStreak
+      });
+
+      onFinishWorkout(session);
     } catch (err) {
-      console.error('Failed to save session to IndexedDB:', err);
+      console.error('Failed to save recovery day:', err);
+    }
+  };
+
+  // =========================================================================
+  // AUTOMATIC TIMELINE STEP TRANSITIONS
+  // =========================================================================
+  const startExerciseStep = useCallback((idx: number) => {
+    const item = timeline[idx];
+    if (!item) {
+      handleWorkoutComplete();
+      return;
     }
 
-    onFinishWorkout(session);
+    setTimelineIndex(idx);
+    setTimerRemaining(item.duration);
+    setPlayerState('EXERCISING');
+    targetEndTimeRef.current = Date.now() + item.duration * 1000;
+
+    // Audio & Voice announcement
+    speechEngine.announceExercise(
+      item.exerciseName,
+      item.target,
+      item.unit,
+      item.duration
+    );
+  }, [timeline, handleWorkoutComplete]);
+
+  const startRestStep = useCallback((restDurationSeconds: number) => {
+    setRestRemaining(restDurationSeconds);
+    setPlayerState('RESTING');
+    targetEndTimeRef.current = Date.now() + restDurationSeconds * 1000;
+
+    soundEngine.playFinish();
+    triggerHaptic(100, settings.vibrationEnabled);
+    speechEngine.announceRest(restDurationSeconds);
+  }, [settings.vibrationEnabled]);
+
+  const handleExerciseTimerZero = useCallback(() => {
+    setCompletedIndices(prev => new Set(prev).add(timelineIndex));
+    const item = timeline[timelineIndex];
+
+    if (!item) {
+      handleWorkoutComplete();
+      return;
+    }
+
+    // If item has rest duration > 0, transition immediately to REST
+    if (item.restDuration > 0) {
+      startRestStep(item.restDuration);
+    } else {
+      // No rest (e.g. final cooldown set) -> advance directly or complete
+      if (timelineIndex < timeline.length - 1) {
+        startExerciseStep(timelineIndex + 1);
+      } else {
+        handleWorkoutComplete();
+      }
+    }
+  }, [timelineIndex, timeline, startRestStep, startExerciseStep, handleWorkoutComplete]);
+
+  const handleRestTimerZero = useCallback(() => {
+    soundEngine.playRestComplete();
+    triggerHaptic([100, 50, 100], settings.vibrationEnabled);
+
+    if (timelineIndex < timeline.length - 1) {
+      startExerciseStep(timelineIndex + 1);
+    } else {
+      handleWorkoutComplete();
+    }
+  }, [timelineIndex, timeline.length, settings.vibrationEnabled, startExerciseStep, handleWorkoutComplete]);
+
+  // =========================================================================
+  // ONE START BUTTON FOR THE ENTIRE WORKOUT
+  // =========================================================================
+  const handleStartWorkout = () => {
+    if (timeline.length === 0) return;
+    setPlayerState('PREPARING');
+    setPrepareRemaining(3);
+    targetEndTimeRef.current = Date.now() + 3000;
+    speechEngine.speak('Workout starting in three, two, one.');
   };
 
-  // Format seconds to MM:SS
-  const formatTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  // =========================================================================
+  // REST EXTENSION (+10 SECONDS BUTTON)
+  // =========================================================================
+  const handleExtendRest = () => {
+    if (playerState !== 'RESTING') return;
+    setRestRemaining(prev => {
+      const next = prev + 10;
+      if (targetEndTimeRef.current !== null) {
+        targetEndTimeRef.current += 10000;
+      } else {
+        targetEndTimeRef.current = Date.now() + next * 1000;
+      }
+      return next;
+    });
+    triggerHaptic(50, settings.vibrationEnabled);
   };
 
-  // Calculate overall workout progress
-  const totalSetsInWorkout = workoutDay.mainExercises.reduce((acc, e) => acc + e.sets, 0);
-  const completedSetsInWorkout = workoutDay.mainExercises.reduce((acc, e) => {
-    const sets = recordedSets[e.exerciseId] || [];
-    return acc + sets.filter(s => s.completed).length;
-  }, 0);
-  const workoutProgressPct = Math.round((completedSetsInWorkout / Math.max(1, totalSetsInWorkout)) * 100);
+  // Optional manual skip rest if user feels ready early
+  const handleSkipRest = () => {
+    if (playerState !== 'RESTING') return;
+    handleRestTimerZero();
+  };
 
-  return (
-    <div className="w-full max-w-6xl mx-auto space-y-4 pb-24 lg:pb-8 animate-fadeIn select-none">
-      {/* Top Navigation & Status Bar */}
-      <div className="flex items-center justify-between bg-[#16191f] border border-white/10 rounded-2xl p-3 sm:p-4">
-        <div className="flex items-center gap-3">
+  // =========================================================================
+  // ONLY ONE MAIN CONTROL — PAUSE & SAVE
+  // =========================================================================
+  const handlePauseAndSave = async () => {
+    if (playerState === 'PAUSED' || playerState === 'COMPLETED' || playerState === 'IDLE') return;
+
+    const savedStateVal: SavedWorkoutState = {
+      dayNumber,
+      timelineIndex,
+      state: playerState,
+      remainingSeconds: timerRemaining,
+      restRemainingSeconds: restRemaining,
+      totalSeconds,
+      activeSeconds,
+      restSeconds,
+      completedTimelineIndices: Array.from(completedIndices),
+      lastSavedAt: Date.now()
+    };
+
+    setPlayerState('PAUSED');
+    targetEndTimeRef.current = null;
+    speechEngine.stop();
+    const normalized = normalizeSavedSession(savedStateVal, timeline, dayNumber);
+    setSavedWorkout(normalized);
+
+    try {
+      await db.activeWorkout.put({ id: 'current', state: savedStateVal });
+    } catch (err) {
+      console.error('Failed to save paused state:', err);
+    }
+  };
+
+  // Resume Workout from paused point
+  const handleResumeWorkout = () => {
+    if (!savedWorkout) {
+      startExerciseStep(0);
+      return;
+    }
+
+    const stateToResume = savedWorkout.state === 'RESTING' ? 'RESTING' : 'EXERCISING';
+    const remaining = stateToResume === 'RESTING'
+      ? savedWorkout.restRemainingSeconds
+      : savedWorkout.remainingSeconds;
+
+    const safeIndex = Math.max(0, Math.min(timeline.length - 1, savedWorkout.timelineIndex));
+    setTimelineIndex(safeIndex);
+    setTimerRemaining(savedWorkout.remainingSeconds);
+    setRestRemaining(savedWorkout.restRemainingSeconds);
+    setTotalSeconds(savedWorkout.totalSeconds);
+    setActiveSeconds(savedWorkout.activeSeconds);
+    setRestSeconds(savedWorkout.restSeconds);
+    setCompletedIndices(new Set(savedWorkout.completedTimelineIndices || []));
+
+    setPlayerState(stateToResume);
+    targetEndTimeRef.current = Date.now() + remaining * 1000;
+
+    const current = timeline[safeIndex];
+    if (current && stateToResume === 'EXERCISING') {
+      speechEngine.speak(`Resuming ${current.exerciseName}.`);
+    } else {
+      speechEngine.speak('Resuming rest.');
+    }
+  };
+
+  // Reset and Discard Workout
+  const handleDiscardWorkout = async () => {
+    setPlayerState('IDLE');
+    setSavedWorkout(null);
+    targetEndTimeRef.current = null;
+    setTotalSeconds(0);
+    setActiveSeconds(0);
+    setRestSeconds(0);
+    setTimelineIndex(0);
+    setCompletedIndices(new Set());
+    try {
+      await db.activeWorkout.delete('current');
+    } catch (err) {
+      console.error('Failed to clear active workout:', err);
+    }
+  };
+
+  // =========================================================================
+  // HIGH-RESOLUTION TICK LOOP & BACKGROUND VISIBILITY SYNC
+  // =========================================================================
+  useEffect(() => {
+    if (playerState === 'IDLE' || playerState === 'PAUSED' || playerState === 'COMPLETED') {
+      return;
+    }
+
+    const intervalId = setInterval(() => {
+      const now = Date.now();
+      lastTickTimeRef.current = now;
+
+      // Update stopwatch
+      setTotalSeconds(prev => prev + 1);
+      if (playerState === 'EXERCISING') {
+        setActiveSeconds(prev => prev + 1);
+      } else if (playerState === 'RESTING') {
+        setRestSeconds(prev => prev + 1);
+      }
+
+      // Handle precise timestamp countdown
+      if (targetEndTimeRef.current !== null) {
+        const remainingMs = targetEndTimeRef.current - now;
+        const remainingSecs = Math.max(0, Math.ceil(remainingMs / 1000));
+
+        if (playerState === 'PREPARING') {
+          setPrepareRemaining(remainingSecs);
+          if (remainingSecs <= 3 && remainingSecs > 0) {
+            soundEngine.playTick();
+          }
+          if (remainingSecs <= 0) {
+            startExerciseStep(0);
+          }
+        } else if (playerState === 'EXERCISING') {
+          setTimerRemaining(remainingSecs);
+
+          // 3-2-1 countdown tick
+          if (remainingSecs <= 3 && remainingSecs > 0) {
+            soundEngine.playTick();
+          }
+
+          if (remainingSecs <= 0) {
+            handleExerciseTimerZero();
+          }
+        } else if (playerState === 'RESTING') {
+          setRestRemaining(remainingSecs);
+
+          // 3-2-1 rest countdown tick & speech warning
+          if (remainingSecs === 3) {
+            speechEngine.announceNextUpcoming(nextItem?.exerciseName || 'Next exercise');
+            soundEngine.playTick();
+          } else if (remainingSecs <= 2 && remainingSecs > 0) {
+            soundEngine.playTick();
+          }
+
+          if (remainingSecs <= 0) {
+            handleRestTimerZero();
+          }
+        }
+      }
+    }, 1000);
+
+    return () => clearInterval(intervalId);
+  }, [
+    playerState,
+    startExerciseStep,
+    handleExerciseTimerZero,
+    handleRestTimerZero,
+    nextItem?.exerciseName
+  ]);
+
+  // Sync accurately when returning from background (visibility change)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && targetEndTimeRef.current !== null) {
+        const remainingSecs = Math.max(0, Math.ceil((targetEndTimeRef.current - Date.now()) / 1000));
+        if (playerState === 'EXERCISING') {
+          setTimerRemaining(remainingSecs);
+          if (remainingSecs <= 0) handleExerciseTimerZero();
+        } else if (playerState === 'RESTING') {
+          setRestRemaining(remainingSecs);
+          if (remainingSecs <= 0) handleRestTimerZero();
+        } else if (playerState === 'PREPARING') {
+          setPrepareRemaining(remainingSecs);
+          if (remainingSecs <= 0) startExerciseStep(0);
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [playerState, handleExerciseTimerZero, handleRestTimerZero, startExerciseStep]);
+
+  // Toggle Fullscreen mode
+  const toggleFullscreen = () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().then(() => setIsFullscreen(true)).catch(() => {});
+    } else {
+      document.exitFullscreen().then(() => setIsFullscreen(false)).catch(() => {});
+    }
+  };
+
+  // Workout progress percentage across all sets
+  const totalSetsCount = Math.max(1, timeline.length);
+  const completedSetsCount = completedIndices.size;
+  const progressPct = Math.min(100, Math.round((completedSetsCount / totalSetsCount) * 100));
+
+  // =========================================================================
+  // RENDER: RECOVERY DAY SCREEN
+  // =========================================================================
+  if (workoutDay.isRecovery) {
+    return (
+      <div className="w-full max-w-2xl mx-auto min-h-[80vh] flex flex-col justify-center items-center text-center p-6 space-y-6 animate-fadeIn select-none">
+        <div className="w-20 h-20 rounded-3xl bg-sky-500/10 text-sky-400 border border-sky-500/20 flex items-center justify-center shadow-[0_0_30px_rgba(56,189,248,0.2)]">
+          <Heart size={40} />
+        </div>
+
+        <div className="space-y-2">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-sky-500/10 text-sky-400 text-xs font-bold uppercase tracking-wider border border-sky-500/20">
+            DAY {String(workoutDay.dayNumber).padStart(2, '0')} • Active Recovery Day
+          </div>
+          <h2 className="text-3xl sm:text-4xl font-black text-white">{workoutDay.title}</h2>
+          <p className="text-sm text-white/60 max-w-md mx-auto leading-relaxed">
+            {workoutDay.description || 'Rest, rebuild muscle fibers, and let your central nervous system recharge. Take a gentle 20–30 minute walk or perform light stretching.'}
+          </p>
+        </div>
+
+        <div className="w-full p-5 rounded-2xl bg-[#16191f] border border-white/5 space-y-3 text-left">
+          <h4 className="text-xs font-bold text-white/80 uppercase tracking-wider">Prescribed Recovery Activities:</h4>
+          <ul className="space-y-2 text-xs text-white/60">
+            <li className="flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+              <span>20–30 minute gentle outdoor walk for blood flow</span>
+            </li>
+            <li className="flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+              <span>Hydrate adequately (at least 2.5–3 litres)</span>
+            </li>
+            <li className="flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
+              <span>Full body mobility flow and gentle hamstring/quad stretches</span>
+            </li>
+          </ul>
+        </div>
+
+        <div className="w-full space-y-3 pt-2">
           <button
-            onClick={() => setShowExitConfirm(true)}
-            className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/60 hover:text-white transition"
-            title="Exit Workout"
+            onClick={handleCompleteRecoveryDay}
+            className="w-full py-4 rounded-2xl bg-sky-400 text-black font-black text-base hover:bg-sky-300 transition shadow-[0_0_25px_rgba(56,189,248,0.35)] active:scale-98 flex items-center justify-center gap-2"
           >
-            <X size={18} />
+            <CheckCircle2 size={20} />
+            <span>Mark Recovery Day Observed</span>
           </button>
+
+          <button
+            onClick={onExit}
+            className="w-full py-3 rounded-xl bg-white/5 text-white/60 hover:text-white text-xs font-semibold transition"
+          >
+            Return to Dashboard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // RENDER: IDLE (LAUNCH SCREEN - ONE START BUTTON)
+  // =========================================================================
+  if (playerState === 'IDLE') {
+    return (
+      <div className="w-full max-w-3xl mx-auto min-h-[85vh] flex flex-col justify-between p-4 sm:p-6 space-y-6 animate-fadeIn select-none">
+        {/* Top Header */}
+        <div className="flex items-center justify-between">
+          <button
+            onClick={onExit}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-xs font-semibold transition"
+          >
+            <ArrowLeft size={16} />
+            <span>Dashboard</span>
+          </button>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSoundOn(!soundOn)}
+              className={`p-2 rounded-xl border transition ${
+                soundOn ? 'bg-white/10 text-white border-white/10' : 'bg-red-500/10 text-red-400 border-red-500/20'
+              }`}
+              title={soundOn ? 'Sound Effects Enabled' : 'Sound Effects Muted'}
+            >
+              {soundOn ? <Volume2 size={16} /> : <VolumeX size={16} />}
+            </button>
+          </div>
+        </div>
+
+        {/* Workout Information Card */}
+        <div className="space-y-5 text-center sm:text-left">
+          <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-[#a3e635]/15 border border-[#a3e635]/30 text-xs font-black text-[#a3e635] uppercase tracking-wider">
+            <Sparkles size={13} />
+            <span>DAY {String(workoutDay.dayNumber).padStart(2, '0')} • PHASE 0{workoutDay.phase}</span>
+          </div>
+
           <div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-black tracking-wider text-[#a3e635]">
-                DAY {String(workoutDay.dayNumber).padStart(2, '0')}
+            <h1 className="text-3xl sm:text-5xl font-black text-white tracking-tight leading-tight">
+              {workoutDay.title}
+            </h1>
+            <p className="text-sm sm:text-base text-white/60 mt-2 max-w-xl leading-relaxed">
+              {workoutDay.description}
+            </p>
+          </div>
+
+          {/* Quick Metrics */}
+          <div className="grid grid-cols-3 gap-3 p-4 rounded-2xl bg-[#16191f] border border-white/5 text-center">
+            <div>
+              <span className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Total Sets</span>
+              <div className="text-xl sm:text-2xl font-black text-white mt-0.5">{timeline.length}</div>
+            </div>
+            <div>
+              <span className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Estimated Time</span>
+              <div className="text-xl sm:text-2xl font-black text-[#a3e635] mt-0.5">
+                ~{Math.round(timeline.reduce((acc, i) => acc + i.duration + i.restDuration, 0) / 60)}m
+              </div>
+            </div>
+            <div>
+              <span className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Hands-Free</span>
+              <div className="text-xl sm:text-2xl font-black text-white mt-0.5">100%</div>
+            </div>
+          </div>
+
+          {/* Sequence Overview */}
+          <div className="p-4 rounded-2xl bg-white/5 border border-white/5 text-xs text-white/70 space-y-2">
+            <div className="font-bold text-white flex items-center justify-between">
+              <span>Automatic Workout Flow</span>
+              <span className="text-[#a3e635] font-normal">Continuous Hands-Free</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-[11px] text-white/60">
+              <span className="px-2.5 py-1 rounded-lg bg-black/40 border border-white/10 text-amber-300">
+                1. Warm-up ({workoutDay.warmupExercises.length} drills)
               </span>
-              <span className="text-white/30">•</span>
-              <span className="text-xs font-bold text-white uppercase tracking-wider">
-                {currentPhase} Phase
+              <span>→</span>
+              <span className="px-2.5 py-1 rounded-lg bg-black/40 border border-white/10 text-[#a3e635]">
+                2. Main Strength ({workoutDay.mainExercises.length} movements)
+              </span>
+              <span>→</span>
+              <span className="px-2.5 py-1 rounded-lg bg-black/40 border border-white/10 text-sky-300">
+                3. Cooldown ({workoutDay.cooldownExercises.length} stretches)
               </span>
             </div>
-            <h3 className="text-sm sm:text-base font-bold text-white truncate max-w-xs sm:max-w-md">
-              {workoutDay.title}
+          </div>
+        </div>
+
+        {/* Start / Continue Button Container */}
+        <div className="space-y-3 pt-4">
+          {savedWorkout ? (
+            <div className="space-y-2.5">
+              <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-300 flex items-center justify-between">
+                <div>
+                  <span className="font-bold">Paused Session Found: </span>
+                  <span>
+                    {savedWorkout.exerciseName || timeline[savedWorkout.timelineIndex]?.exerciseName || 'Workout'} • Set {savedWorkout.setNumber || timeline[savedWorkout.timelineIndex]?.setNumber || 1} of {savedWorkout.totalSets || timeline[savedWorkout.timelineIndex]?.totalSets || 1}
+                  </span>
+                </div>
+                <button
+                  onClick={handleDiscardWorkout}
+                  className="text-[11px] underline hover:text-white"
+                >
+                  Discard
+                </button>
+              </div>
+
+              <button
+                onClick={handleResumeWorkout}
+                className="w-full py-5 rounded-2xl bg-[#a3e635] text-black font-black text-lg hover:bg-[#bef264] transition-all shadow-[0_0_30px_rgba(163,230,53,0.4)] active:scale-98 flex items-center justify-center gap-3"
+              >
+                <Play size={22} fill="currentColor" />
+                <span>CONTINUE WORKOUT</span>
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={handleStartWorkout}
+              className="w-full py-5 rounded-2xl bg-[#a3e635] text-black font-black text-lg hover:bg-[#bef264] transition-all shadow-[0_0_30px_rgba(163,230,53,0.4)] active:scale-98 flex items-center justify-center gap-3"
+            >
+              <Play size={22} fill="currentColor" />
+              <span>START WORKOUT</span>
+            </button>
+          )}
+
+          <p className="text-[11px] text-center text-white/40">
+            Press once, place phone on stand, and train hands-free. Timers & transitions run automatically.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // RENDER: PREPARING (3, 2, 1 COUNTDOWN)
+  // =========================================================================
+  if (playerState === 'PREPARING') {
+    return (
+      <div className="w-full h-[100dvh] max-h-screen flex flex-col justify-center items-center text-center p-6 space-y-6 select-none bg-[#0d0f12]">
+        <span className="text-xs font-bold text-[#a3e635] uppercase tracking-widest">
+          GET READY
+        </span>
+        <div className="text-8xl sm:text-9xl font-black font-mono text-white animate-bounce">
+          {prepareRemaining}
+        </div>
+        <p className="text-sm text-white/60">
+          First up: <span className="text-white font-bold">{timeline[0]?.exerciseName}</span>
+        </p>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // RENDER: PAUSED SCREEN (PAUSE & SAVE STATE)
+  // =========================================================================
+  if (playerState === 'PAUSED') {
+    return (
+      <div className="w-full max-w-md mx-auto min-h-[80vh] flex flex-col justify-center items-center text-center p-6 space-y-6 animate-fadeIn select-none">
+        <div className="w-20 h-20 rounded-3xl bg-amber-500/10 text-amber-400 border border-amber-500/20 flex items-center justify-center shadow-[0_0_30px_rgba(245,158,11,0.25)]">
+          <Pause size={38} />
+        </div>
+
+        <div className="space-y-1.5">
+          <h2 className="text-3xl font-black text-white">WORKOUT PAUSED</h2>
+          <p className="text-sm text-[#a3e635] font-semibold">Progress saved locally.</p>
+          <p className="text-xs text-white/50 max-w-xs mx-auto">
+            Safe to leave the page or close your browser. You can resume from this exact point anytime.
+          </p>
+        </div>
+
+        {/* Current Position Card */}
+        <div className="w-full p-4 rounded-2xl bg-[#16191f] border border-white/5 text-left space-y-1">
+          <span className="text-[10px] text-white/40 uppercase font-bold tracking-wider">Saved Position</span>
+          <div className="text-base font-black text-white">
+            {currentItem?.exerciseName || timeline[Math.max(0, Math.min(timeline.length - 1, timelineIndex))]?.exerciseName || 'Push-ups'}
+          </div>
+          <div className="text-xs text-white/60">
+            Set {currentItem?.setNumber || timeline[Math.max(0, Math.min(timeline.length - 1, timelineIndex))]?.setNumber || 1} of {currentItem?.totalSets || timeline[Math.max(0, Math.min(timeline.length - 1, timelineIndex))]?.totalSets || 3} • Time remaining: {formatTime(timerRemaining)}
+          </div>
+        </div>
+
+        {/* Resume Button */}
+        <div className="w-full space-y-3 pt-2">
+          <button
+            onClick={handleResumeWorkout}
+            className="w-full py-4 rounded-2xl bg-[#a3e635] text-black font-black text-base hover:bg-[#bef264] transition shadow-[0_0_20px_rgba(163,230,53,0.35)] active:scale-98 flex items-center justify-center gap-2"
+          >
+            <Play size={18} fill="currentColor" />
+            <span>RESUME WORKOUT</span>
+          </button>
+
+          <button
+            onClick={onExit}
+            className="w-full py-3 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 hover:text-white text-xs font-semibold transition"
+          >
+            Exit to Dashboard (Keep Saved)
+          </button>
+
+          <button
+            onClick={handleDiscardWorkout}
+            className="w-full py-2.5 rounded-xl text-red-400 hover:text-red-300 text-xs font-medium transition"
+          >
+            Discard Workout & Reset
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // RENDER: COMPLETED SCREEN (CELEBRATION)
+  // =========================================================================
+  if (playerState === 'COMPLETED') {
+    return (
+      <div className="w-full max-w-lg mx-auto min-h-[85vh] flex flex-col justify-center items-center text-center p-6 space-y-6 animate-fadeIn select-none">
+        <div className="w-24 h-24 rounded-3xl bg-[#a3e635]/20 text-[#a3e635] border border-[#a3e635]/40 flex items-center justify-center shadow-[0_0_40px_rgba(163,230,53,0.4)]">
+          <Award size={48} />
+        </div>
+
+        <div className="space-y-1.5">
+          <span className="text-xs font-bold text-[#a3e635] uppercase tracking-widest">
+            SESSION COMPLETE
+          </span>
+          <h2 className="text-3xl sm:text-4xl font-black text-white">
+            Day {workoutDay.dayNumber} Crushed!
+          </h2>
+          <p className="text-xs sm:text-sm text-white/60 max-w-md mx-auto">
+            Discipline builds strength. The entire hands-free workout has been verified and saved to your progress history.
+          </p>
+        </div>
+
+        {/* Metrics Grid */}
+        <div className="w-full grid grid-cols-3 gap-3 p-4 rounded-2xl bg-[#16191f] border border-white/5 text-center">
+          <div>
+            <span className="text-[10px] text-white/40 uppercase font-semibold">Total Duration</span>
+            <div className="text-base sm:text-lg font-black text-white mt-0.5">{formatTime(totalSeconds)}</div>
+          </div>
+          <div>
+            <span className="text-[10px] text-white/40 uppercase font-semibold">Completed Sets</span>
+            <div className="text-base sm:text-lg font-black text-[#a3e635] mt-0.5">{timeline.length}</div>
+          </div>
+          <div>
+            <span className="text-[10px] text-white/40 uppercase font-semibold">Rep Log Type</span>
+            <div className="text-base sm:text-lg font-black text-white mt-0.5 text-xs truncate">Estimated</div>
+          </div>
+        </div>
+
+        <div className="w-full p-3 rounded-xl bg-white/5 border border-white/5 text-xs text-white/60 text-center">
+          <span className="text-[#a3e635] font-bold">Programme Advanced: </span>
+          <span>Day {Math.min(30, workoutDay.dayNumber + 1)} is now your next pending workout.</span>
+        </div>
+
+        <button
+          onClick={() => onFinishWorkout({} as WorkoutSession)}
+          className="w-full py-4 rounded-2xl bg-[#a3e635] text-black font-black text-base hover:bg-[#bef264] transition shadow-[0_0_20px_rgba(163,230,53,0.35)] active:scale-98"
+        >
+          Return to Dashboard
+        </button>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // RENDER: REST SCREEN (DURING REST INTERVALS)
+  // =========================================================================
+  if (playerState === 'RESTING') {
+    const nextPreviewEx = nextItem ? getSafeExercise(nextItem.exerciseId) : undefined;
+
+    return (
+      <div className="w-full h-[100dvh] max-h-screen flex flex-col justify-between p-3 sm:p-5 select-none bg-[#0d0f12] overflow-hidden">
+        {/* Overall Workout Progress Bar */}
+        <div className="w-full space-y-1.5">
+          <div className="flex items-center justify-between text-[11px] font-bold text-white/50 uppercase tracking-wider">
+            <span>Overall Progress</span>
+            <span className="text-[#a3e635]">{progressPct}%</span>
+          </div>
+          <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+            <div
+              className="h-full bg-[#a3e635] transition-all duration-500 ease-out"
+              style={{ width: `${progressPct}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Rest Content (Centered, huge timer, next preview) */}
+        <div className="flex-1 flex flex-col items-center justify-center space-y-4 my-auto">
+          <div className="space-y-1 text-center">
+            <span className="text-xs sm:text-sm font-black text-amber-400 uppercase tracking-widest">
+              REST & RECOVER
+            </span>
+            <h3 className="text-base sm:text-lg font-bold text-white/80">
+              {nextItem ? `Next: ${nextItem.exerciseName} — Set ${nextItem.setNumber} of ${nextItem.totalSets}` : 'Final Cooldown'}
             </h3>
           </div>
-        </div>
 
-        {/* Stopwatch & Pause */}
-        <div className="flex items-center gap-3">
-          <div className="flex flex-col items-end">
-            <span className="text-xs font-mono font-bold text-white">{formatTime(totalSeconds)}</span>
-            <span className="text-[10px] text-white/40">Active: {formatTime(activeSeconds)}</span>
+          {/* Huge Rest Countdown Timer - readable from 2-3m */}
+          <div className="text-7xl sm:text-9xl font-black font-mono text-white tracking-tight text-center drop-shadow-[0_0_35px_rgba(255,255,255,0.2)]">
+            {formatTime(restRemaining)}
           </div>
 
-          <button
-            onClick={() => setIsPaused(!isPaused)}
-            className={`p-2 rounded-xl transition ${
-              isPaused ? 'bg-amber-500 text-black font-bold' : 'bg-white/5 hover:bg-white/10 text-white'
-            }`}
-            title={isPaused ? 'Resume Workout' : 'Pause Workout'}
-          >
-            {isPaused ? <Play size={18} fill="currentColor" /> : <Pause size={18} />}
-          </button>
-        </div>
-      </div>
-
-      {/* Phase Selector Tabs */}
-      <div className="flex items-center gap-2 px-1 text-xs font-semibold">
-        {workoutDay.warmupExercises.length > 0 && (
-          <button
-            onClick={() => {
-              setCurrentPhase('warmup');
-              setExerciseIndex(0);
-              setCurrentSetIndex(0);
-            }}
-            className={`px-3 py-1.5 rounded-xl border transition ${
-              currentPhase === 'warmup'
-                ? 'bg-[#a3e635]/20 text-[#a3e635] border-[#a3e635]/40'
-                : 'bg-white/5 text-white/50 border-white/5 hover:text-white'
-            }`}
-          >
-            1. Warm-up
-          </button>
-        )}
-        <button
-          onClick={() => {
-            setCurrentPhase('main');
-            setExerciseIndex(0);
-            setCurrentSetIndex(0);
-          }}
-          className={`px-3 py-1.5 rounded-xl border transition ${
-            currentPhase === 'main'
-              ? 'bg-[#a3e635] text-black border-[#a3e635] font-bold shadow-[0_0_15px_rgba(163,230,53,0.3)]'
-              : 'bg-white/5 text-white/50 border-white/5 hover:text-white'
-          }`}
-        >
-          2. Main Workout
-        </button>
-        {workoutDay.cooldownExercises.length > 0 && (
-          <button
-            onClick={() => {
-              setCurrentPhase('cooldown');
-              setExerciseIndex(0);
-              setCurrentSetIndex(0);
-            }}
-            className={`px-3 py-1.5 rounded-xl border transition ${
-              currentPhase === 'cooldown'
-                ? 'bg-[#a3e635]/20 text-[#a3e635] border-[#a3e635]/40'
-                : 'bg-white/5 text-white/50 border-white/5 hover:text-white'
-            }`}
-          >
-            3. Cooldown
-          </button>
-        )}
-      </div>
-
-      {/* Main Grid: Responsive Side-by-Side on Desktop, Stacked on Mobile */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* Left Column: Animated Exercise Demonstration */}
-        <div className="lg:col-span-7 space-y-3">
-          <ExerciseAnimator
-            exercise={currentEx}
-            speed={settings.animationSpeed}
-            showControls={true}
-            className="w-full min-h-[280px] sm:min-h-[350px]"
-          />
-
-          {/* Alternative Notice if applicable */}
-          {currentEx.hasEquipmentAlternative && (
-            <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/20 text-xs text-blue-300">
-              <span className="font-bold">No-Equipment Setup: </span>
-              {currentEx.equipmentAlternativeNotice}
+          {/* Optional next exercise preview illustration */}
+          {nextPreviewEx && (
+            <div className="w-full max-w-xs h-[140px] sm:h-[180px] rounded-2xl overflow-hidden opacity-75 border border-white/10">
+              <ExerciseAnimator
+                exercise={nextPreviewEx}
+                showControls={false}
+                className="w-full h-full"
+              />
             </div>
           )}
         </div>
 
-        {/* Right Column: Active Exercise Controls & Set Recorder */}
-        <div className="lg:col-span-5 flex flex-col justify-between space-y-4">
-          <div className="space-y-4">
-            {/* Exercise Title & Instructions Link */}
-            <div className="flex items-start justify-between">
-              <div>
-                <span className="text-[11px] font-bold text-[#a3e635] uppercase tracking-wider">
-                  Exercise {exerciseIndex + 1} of {activeExerciseList.length}
-                </span>
-                <h2 className="text-2xl font-black text-white tracking-tight mt-0.5">
-                  {currentEx.name}
-                </h2>
-                <p className="text-xs text-white/50">
-                  Target: {currentSched.sets} sets × {currentSched.repsOrDuration} {currentSched.unit}
-                </p>
-              </div>
-
-              <button
-                onClick={() => setShowInstructionModal(true)}
-                className="p-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/60 hover:text-white"
-                title="View Form Tips & Common Mistakes"
-              >
-                <HelpCircle size={18} />
-              </button>
-            </div>
-
-            {/* Set Progress Indicators */}
-            <div className="p-3.5 rounded-2xl bg-[#16191f] border border-white/5 space-y-2">
-              <div className="flex items-center justify-between text-xs text-white/60 font-semibold">
-                <span>
-                  SET {currentSetIndex + 1} OF {currentSched.sets}
-                </span>
-                <span>{workoutProgressPct}% Workout Done</span>
-              </div>
-
-              <div className="flex items-center gap-2">
-                {Array.from({ length: currentSched.sets }).map((_, idx) => {
-                  const setRec = recordedSets[currentSched.exerciseId]?.[idx];
-                  const isDone = setRec?.completed;
-                  const isCurrent = idx === currentSetIndex;
-
-                  return (
-                    <div
-                      key={idx}
-                      className={`flex-1 h-3 rounded-full transition-all duration-300 ${
-                        isDone
-                          ? 'bg-[#22c55e]'
-                          : isCurrent
-                          ? 'bg-[#a3e635] ring-2 ring-[#a3e635]/40 animate-pulse'
-                          : 'bg-white/10'
-                      }`}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Rep / Duration Active Selector or Countdown */}
-            {!currentEx.isTimed ? (
-              <div className="p-5 rounded-2xl bg-[#16191f] border border-white/5 flex flex-col items-center justify-center space-y-3">
-                <span className="text-xs font-semibold text-white/50 uppercase tracking-wider">
-                  Recorded Repetitions
-                </span>
-                <div className="flex items-center gap-6">
-                  <button
-                    onClick={() => setActiveValue(prev => Math.max(1, prev - 1))}
-                    className="w-12 h-12 rounded-2xl bg-white/5 hover:bg-white/10 text-white flex items-center justify-center text-xl font-bold transition active:scale-95"
-                  >
-                    <Minus size={20} />
-                  </button>
-
-                  <div className="flex flex-col items-center">
-                    <span className="text-5xl font-black text-white">{activeValue}</span>
-                    <span className="text-xs text-white/40 uppercase tracking-widest mt-1">reps</span>
-                  </div>
-
-                  <button
-                    onClick={() => setActiveValue(prev => prev + 1)}
-                    className="w-12 h-12 rounded-2xl bg-white/5 hover:bg-white/10 text-white flex items-center justify-center text-xl font-bold transition active:scale-95"
-                  >
-                    <Plus size={20} />
-                  </button>
-                </div>
-              </div>
-            ) : (
-              /* Timed Exercise Mode (Plank, holds) */
-              <div className="p-5 rounded-2xl bg-[#16191f] border border-white/5 flex flex-col items-center justify-center space-y-3">
-                <span className="text-xs font-semibold text-white/50 uppercase tracking-wider">
-                  Hold Countdown
-                </span>
-                <div className="relative flex items-center justify-center my-1">
-                  <ProgressRing
-                    progress={((currentSched.repsOrDuration - exerciseTimerRemaining) / currentSched.repsOrDuration) * 100}
-                    size={130}
-                    strokeWidth={10}
-                    progressColor="#a3e635"
-                  >
-                    <span className="text-3xl font-black text-white font-mono">
-                      {formatTime(exerciseTimerRemaining)}
-                    </span>
-                    <span className="text-[10px] text-white/50 uppercase mt-0.5">Remaining</span>
-                  </ProgressRing>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={isExerciseTimerRunning ? pauseExerciseTimer : startExerciseTimer}
-                    className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[#a3e635] text-black font-bold text-xs shadow-md transition"
-                  >
-                    {isExerciseTimerRunning ? <Pause size={14} /> : <Play size={14} fill="currentColor" />}
-                    <span>{isExerciseTimerRunning ? 'Pause Timer' : 'Start Countdown'}</span>
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      pauseExerciseTimer();
-                      setExerciseTimerRemaining(currentSched.repsOrDuration);
-                    }}
-                    className="p-2.5 rounded-xl bg-white/5 text-white/70 hover:text-white"
-                    title="Reset Timer"
-                  >
-                    <RotateCcw size={16} />
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Action Button: COMPLETE SET */}
-          <div className="space-y-3 pt-2">
+        {/* Controls: +10 SECONDS & PAUSE & SAVE */}
+        <div className="space-y-2.5 w-full max-w-md mx-auto pb-1">
+          <div className="grid grid-cols-2 gap-2.5">
             <button
-              onClick={() => handleCompleteSet(activeValue)}
-              className="w-full py-4 rounded-2xl bg-[#a3e635] text-black font-black text-base hover:bg-[#bef264] transition-all shadow-[0_0_20px_rgba(163,230,53,0.35)] active:scale-[0.98] flex items-center justify-center gap-2"
+              onClick={handleExtendRest}
+              className="py-3.5 rounded-2xl bg-white/10 hover:bg-white/20 border border-white/15 text-white font-black text-sm transition active:scale-95 flex items-center justify-center gap-1.5 shadow-md"
             >
-              <CheckCircle size={20} />
-              <span>Complete Set {currentSetIndex + 1}</span>
+              <Plus size={16} />
+              <span>+10 SECONDS</span>
             </button>
 
-            {/* Sub-actions: Undo, Skip, Rest */}
-            <div className="flex items-center justify-between text-xs text-white/60">
-              <button
-                onClick={handleUndoSet}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition"
-              >
-                <RotateCcw size={13} />
-                <span>Undo Set</span>
-              </button>
-
-              <button
-                onClick={() => triggerRestTimer(currentSched.restDuration || settings.defaultRestDuration)}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition"
-              >
-                <Clock size={13} />
-                <span>Rest Timer</span>
-              </button>
-
-              <button
-                onClick={handleSkipExercise}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition"
-              >
-                <SkipForward size={13} />
-                <span>Skip Movement</span>
-              </button>
-            </div>
+            <button
+              onClick={handleSkipRest}
+              className="py-3.5 rounded-2xl bg-white/5 hover:bg-white/10 border border-white/10 text-white/70 hover:text-white font-bold text-xs transition"
+            >
+              Skip Rest & Begin
+            </button>
           </div>
+
+          <button
+            onClick={handlePauseAndSave}
+            className="w-full py-3.5 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 text-white font-bold text-xs transition active:scale-98 flex items-center justify-center gap-2"
+          >
+            <Pause size={14} />
+            <span>PAUSE & SAVE</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // RENDER: EXERCISING (ACTIVE HANDS-FREE FULL-SCREEN PLAYER)
+  // =========================================================================
+  const safeTimelineIndex = Math.max(0, Math.min(Math.max(0, timeline.length - 1), timelineIndex));
+  const safeCurrentItem: WorkoutTimelineItem | undefined = currentItem || timeline[safeTimelineIndex] || timeline[0];
+  const safeExercise = currentEx || (safeCurrentItem ? getSafeExercise(safeCurrentItem.exerciseId) : getSafeExercise('push-ups'));
+
+  if (!safeCurrentItem) {
+    return (
+      <div className="w-full min-h-[80vh] flex flex-col justify-center items-center text-center p-6 space-y-4 text-white select-none">
+        <h3 className="text-xl font-bold">UNABLE TO RESUME WORKOUT</h3>
+        <p className="text-xs text-white/60">Workout timeline could not be initialized.</p>
+        <button onClick={onExit} className="px-5 py-2.5 rounded-xl bg-white/10 text-white text-xs font-semibold">
+          RETURN TO DASHBOARD
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full h-[100dvh] max-h-screen flex flex-col justify-between p-3 sm:p-5 select-none bg-[#0d0f12] overflow-hidden">
+      {/* 1. Overall Workout Progress Bar */}
+      <div className="w-full space-y-1.5">
+        <div className="flex items-center justify-between text-[11px] font-bold text-white/50 uppercase tracking-wider">
+          <div className="flex items-center gap-2">
+            <span
+              className={`px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-wider ${
+                safeCurrentItem.phase === 'warmup'
+                  ? 'bg-amber-500/20 text-amber-300'
+                  : safeCurrentItem.phase === 'cooldown'
+                  ? 'bg-sky-500/20 text-sky-300'
+                  : 'bg-[#a3e635]/20 text-[#a3e635]'
+              }`}
+            >
+              {safeCurrentItem.phase === 'warmup' ? 'WARM-UP' : safeCurrentItem.phase === 'cooldown' ? 'COOLDOWN' : 'MAIN WORKOUT'}
+            </span>
+            <span className="text-white/40">•</span>
+            <span className="text-white/80">DAY {String(workoutDay.dayNumber).padStart(2, '0')}</span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setVoiceOn(!voiceOn)}
+              className={`text-xs font-semibold px-2 py-0.5 rounded border transition ${
+                voiceOn ? 'bg-[#a3e635]/20 text-[#a3e635] border-[#a3e635]/30' : 'bg-white/5 text-white/40 border-white/10'
+              }`}
+              title={voiceOn ? 'Voice Coaching On' : 'Voice Coaching Off'}
+            >
+              Voice
+            </button>
+            <button
+              onClick={toggleFullscreen}
+              className="p-1 rounded text-white/50 hover:text-white"
+              title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+            >
+              {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+            </button>
+            <span className="text-[#a3e635] font-black">{progressPct}%</span>
+          </div>
+        </div>
+
+        <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+          <div
+            className="h-full bg-[#a3e635] transition-all duration-500 ease-out"
+            style={{ width: `${progressPct}%` }}
+          />
         </div>
       </div>
 
-      {/* ======================================================== */}
-      {/* REST TIMER OVERLAY MODAL */}
-      {/* ======================================================== */}
-      {isResting && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fadeIn">
-          <div className="w-full max-w-sm bg-[#16191f] border border-white/10 rounded-3xl p-6 text-center space-y-5 shadow-2xl relative">
-            <div>
-              <span className="text-xs font-bold text-[#a3e635] uppercase tracking-wider">
-                Rest & Recovery
-              </span>
-              <h3 className="text-lg font-bold text-white mt-0.5">Catch Your Breath</h3>
-            </div>
+      {/* 2. Current Exercise Header */}
+      <div className="text-center space-y-1 pt-1">
+        <h2 className="text-2xl sm:text-4xl font-black text-white tracking-tight truncate">
+          {safeCurrentItem.exerciseName}
+        </h2>
 
-            <div className="flex items-center justify-center">
-              <ProgressRing
-                progress={((restDuration - restRemaining) / restDuration) * 100}
-                size={160}
-                strokeWidth={12}
-                progressColor="#a3e635"
-                trackColor="#242b35"
-              >
-                <span className="text-4xl font-black text-white font-mono">{restRemaining}</span>
-                <span className="text-xs text-white/40 uppercase tracking-widest mt-0.5">seconds</span>
-              </ProgressRing>
-            </div>
-
-            {/* Quick add time */}
-            <div className="flex items-center justify-center gap-2">
-              <button
-                onClick={() => addRestTime(15)}
-                className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-white/80"
-              >
-                +15s
-              </button>
-              <button
-                onClick={() => addRestTime(30)}
-                className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-white/80"
-              >
-                +30s
-              </button>
-              <button
-                onClick={() => addRestTime(60)}
-                className="px-3 py-1.5 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-semibold text-white/80"
-              >
-                +60s
-              </button>
-            </div>
-
-            {/* Skip rest button */}
-            <button
-              onClick={skipRest}
-              className="w-full py-3 rounded-xl bg-[#a3e635] text-black font-bold text-sm hover:bg-[#bef264] transition"
-            >
-              Skip Rest & Begin Next Set
-            </button>
-          </div>
+        {/* Set and Target Information */}
+        <div className="flex items-center justify-center gap-3 text-xs sm:text-sm font-bold">
+          <span className="text-white/90">
+            SET {safeCurrentItem.setNumber} OF {safeCurrentItem.totalSets}
+          </span>
+          <span className="text-white/30">•</span>
+          <span className="text-[#a3e635] uppercase tracking-wide">
+            TARGET: {safeCurrentItem.target} {safeCurrentItem.unit === 'reps' ? 'REPS' : 'SEC HOLD'}
+            {safeCurrentItem.targetNote ? ` (${safeCurrentItem.targetNote})` : ''}
+          </span>
         </div>
-      )}
+      </div>
 
-      {/* ======================================================== */}
-      {/* FORM INSTRUCTIONS MODAL */}
-      {/* ======================================================== */}
-      {showInstructionModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn">
-          <div className="w-full max-w-lg bg-[#16191f] border border-white/10 rounded-3xl p-6 shadow-2xl space-y-4 max-h-[85vh] overflow-y-auto relative">
-            <button
-              onClick={() => setShowInstructionModal(false)}
-              className="absolute top-4 right-4 text-white/50 hover:text-white p-1"
-            >
-              <X size={18} />
-            </button>
+      {/* 3. Large Animated Exercise Demonstration (Main visual element) */}
+      <div className="flex-1 flex items-center justify-center w-full max-w-xl mx-auto min-h-[170px] sm:min-h-[220px] max-h-[40vh] my-1">
+        <ExerciseAnimator
+          exercise={safeExercise}
+          showControls={false}
+          speed={settings.animationSpeed}
+          className="w-full h-full max-h-[38vh]"
+        />
+      </div>
 
-            <div>
-              <span className="text-xs font-bold text-[#a3e635] uppercase tracking-wider">
-                Exercise Guide
-              </span>
-              <h3 className="text-xl font-black text-white">{currentEx.name}</h3>
-            </div>
-
-            <div className="space-y-3 text-xs text-white/80">
-              <div className="p-3 rounded-xl bg-white/5">
-                <h5 className="font-bold text-white mb-1">Starting Position:</h5>
-                <p className="text-white/70 leading-relaxed">{currentEx.instructions.startingPosition}</p>
-              </div>
-
-              <div className="p-3 rounded-xl bg-white/5">
-                <h5 className="font-bold text-white mb-1">Movement Execution:</h5>
-                <p className="text-white/70 leading-relaxed">{currentEx.instructions.movement}</p>
-              </div>
-
-              <div className="p-3 rounded-xl bg-white/5">
-                <h5 className="font-bold text-white mb-1">Breathing Cadence:</h5>
-                <p className="text-white/70 leading-relaxed">{currentEx.instructions.breathing}</p>
-              </div>
-
-              <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20">
-                <h5 className="font-bold text-red-400 mb-1">Common Mistakes:</h5>
-                <ul className="list-disc list-inside space-y-1 text-white/70">
-                  {currentEx.instructions.commonMistakes.map((m, i) => (
-                    <li key={i}>{m}</li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-
-            <button
-              onClick={() => setShowInstructionModal(false)}
-              className="w-full py-2.5 rounded-xl bg-[#a3e635] text-black font-bold text-xs"
-            >
-              Back to Workout
-            </button>
-          </div>
+      {/* 4. Very Large Countdown Timer (Readable from 2–3 metres away) */}
+      <div className="flex flex-col items-center justify-center py-1">
+        <div className="text-6xl sm:text-8xl font-black font-mono tracking-tight text-[#a3e635] drop-shadow-[0_0_30px_rgba(163,230,53,0.35)]">
+          {formatTime(timerRemaining)}
         </div>
-      )}
 
-      {/* ======================================================== */}
-      {/* EXIT CONFIRMATION MODAL */}
-      {/* ======================================================== */}
-      {showExitConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fadeIn">
-          <div className="w-full max-w-md bg-[#16191f] border border-white/10 rounded-3xl p-6 text-center space-y-4 shadow-2xl">
-            <h3 className="text-lg font-bold text-white">Exit Workout Session?</h3>
-            <p className="text-xs text-white/60 leading-relaxed">
-              You have completed {completedSetsInWorkout} of {totalSetsInWorkout} sets. How would you like to proceed?
-            </p>
-
-            <div className="space-y-2 pt-2">
-              <button
-                onClick={() => handleSaveAndExit(false)}
-                className="w-full py-3 rounded-xl bg-[#a3e635] text-black font-bold text-xs hover:bg-[#bef264] transition"
-              >
-                Save Partial Progress & Exit
-              </button>
-              <button
-                onClick={onExit}
-                className="w-full py-2.5 rounded-xl bg-red-500/15 text-red-400 hover:bg-red-500/25 border border-red-500/20 font-semibold text-xs transition"
-              >
-                Discard & Exit Without Saving
-              </button>
-              <button
-                onClick={() => setShowExitConfirm(false)}
-                className="w-full py-2.5 rounded-xl bg-white/5 text-white/70 hover:text-white font-medium text-xs transition"
-              >
-                Resume Training
-              </button>
-            </div>
-          </div>
+        {/* Next Exercise Preview */}
+        <div className="text-[11px] sm:text-xs font-semibold text-white/50 mt-1 truncate max-w-xs sm:max-w-md">
+          {safeCurrentItem.restDuration > 0
+            ? `NEXT: REST — ${safeCurrentItem.restDuration} SECONDS`
+            : safeCurrentItem.nextPreview
+            ? `NEXT: ${safeCurrentItem.nextPreview.name}`
+            : 'NEXT: WORKOUT FINISH'}
         </div>
-      )}
+      </div>
 
-      {/* ======================================================== */}
-      {/* WORKOUT COMPLETION CELEBRATION MODAL */}
-      {/* ======================================================== */}
-      {showCompletionModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-xl animate-fadeIn">
-          <div className="w-full max-w-md bg-[#16191f] border border-[#a3e635]/30 rounded-3xl p-7 text-center space-y-5 shadow-2xl">
-            <div className="w-16 h-16 rounded-3xl bg-[#a3e635]/20 text-[#a3e635] mx-auto flex items-center justify-center border border-[#a3e635]/40 shadow-[0_0_30px_rgba(163,230,53,0.35)]">
-              <Award size={36} />
-            </div>
-
-            <div>
-              <span className="text-xs font-bold text-[#a3e635] uppercase tracking-wider">
-                Workout Complete!
-              </span>
-              <h3 className="text-2xl font-black text-white mt-1">Day {workoutDay.dayNumber} Crushed</h3>
-              <p className="text-xs text-white/60 mt-1">
-                Discipline builds strength. Another session in the record books.
-              </p>
-            </div>
-
-            {/* Summary Metrics */}
-            <div className="grid grid-cols-3 gap-2.5 p-3.5 rounded-2xl bg-white/5 border border-white/5 text-center">
-              <div>
-                <span className="text-[10px] text-white/40 uppercase font-semibold">Total Time</span>
-                <div className="text-sm font-black text-white mt-0.5">{formatTime(totalSeconds)}</div>
-              </div>
-              <div>
-                <span className="text-[10px] text-white/40 uppercase font-semibold">Sets Done</span>
-                <div className="text-sm font-black text-[#a3e635] mt-0.5">{completedSetsInWorkout}</div>
-              </div>
-              <div>
-                <span className="text-[10px] text-white/40 uppercase font-semibold">Phase</span>
-                <div className="text-sm font-black text-white mt-0.5">P{workoutDay.phase}</div>
-              </div>
-            </div>
-
-            <button
-              onClick={() => handleSaveAndExit(true)}
-              className="w-full py-3.5 rounded-2xl bg-[#a3e635] text-black font-black text-sm hover:bg-[#bef264] transition shadow-[0_0_20px_rgba(163,230,53,0.4)]"
-            >
-              Save Record & Return to Dashboard
-            </button>
-          </div>
-        </div>
-      )}
+      {/* 5. One Main Control: PAUSE & SAVE */}
+      <div className="w-full max-w-md mx-auto pt-1 pb-1">
+        <button
+          onClick={handlePauseAndSave}
+          className="w-full py-4 rounded-2xl bg-white/10 hover:bg-white/20 border border-white/15 text-white font-black text-sm tracking-wider uppercase transition shadow-lg active:scale-98 flex items-center justify-center gap-2"
+        >
+          <Pause size={16} fill="currentColor" />
+          <span>PAUSE & SAVE</span>
+        </button>
+      </div>
     </div>
   );
 };

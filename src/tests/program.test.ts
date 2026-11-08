@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { WORKOUT_DAYS, getDateForDay, getCurrentChallengeDay } from '../data/program';
+import { WORKOUT_DAYS, getDateForDay } from '../data/program';
 import { EXERCISES } from '../data/exercises';
 import { ASSESSMENT_FIELDS, ASSESSMENT_DAYS } from '../data/assessments';
 

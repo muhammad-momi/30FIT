@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Play,
   Flame,
@@ -9,12 +9,15 @@ import {
   Dumbbell,
   Sparkles,
   ArrowRight,
-  Heart
+  Heart,
+  RotateCcw
 } from 'lucide-react';
 import type { WorkoutSession, UserSettings } from '../../types';
 import { WORKOUT_DAYS, getDateForDay, formatDatePretty } from '../../data/program';
 import { ProgressRing } from '../../components/common/ProgressRing';
 import { OfflineIndicator } from '../../components/common/OfflineIndicator';
+import { db, updateUserSettings } from '../../services/db';
+import { calculateStreak, formatLocalDate, advanceProgramDay } from '../../services/progression';
 
 interface DashboardViewProps {
   currentDay: number;
@@ -23,6 +26,7 @@ interface DashboardViewProps {
   onStartWorkout: (dayNumber: number) => void;
   onNavigate: (tab: 'calendar' | 'workout' | 'library' | 'progress' | 'assessments' | 'settings') => void;
   onToggleMorningDay: (dayNumber: number) => void;
+  onRefreshData?: () => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -31,8 +35,31 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   sessions,
   onStartWorkout,
   onNavigate,
-  onToggleMorningDay
+  onToggleMorningDay,
+  onRefreshData
 }) => {
+  const [hasPausedWorkout, setHasPausedWorkout] = useState<boolean>(false);
+
+  useEffect(() => {
+    let isMounted = true;
+    async function checkPaused() {
+      try {
+        const saved = await db.activeWorkout.get('current');
+        if (isMounted && saved && saved.state && saved.state.dayNumber === currentDay) {
+          setHasPausedWorkout(true);
+        } else if (isMounted) {
+          setHasPausedWorkout(false);
+        }
+      } catch {
+        if (isMounted) setHasPausedWorkout(false);
+      }
+    }
+    checkPaused();
+    return () => {
+      isMounted = false;
+    };
+  }, [currentDay]);
+
   const todayWorkout = WORKOUT_DAYS.find(d => d.dayNumber === currentDay) || WORKOUT_DAYS[0];
   const nextWorkout = WORKOUT_DAYS.find(d => d.dayNumber === currentDay + 1);
   const nextRecoveryDay = WORKOUT_DAYS.find(d => d.dayNumber > currentDay && d.isRecovery);
@@ -46,31 +73,53 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const trainingDaysCount = WORKOUT_DAYS.filter(d => !d.isRecovery).length;
   const overallProgressPct = Math.round((totalCompletedDays / trainingDaysCount) * 100);
 
-  // Compute streak
-  let currentStreak = 0;
-  let bestStreak = 0;
-  let tempStreak = 0;
-
-  for (let d = 1; d <= 30; d++) {
-    const day = WORKOUT_DAYS.find(w => w.dayNumber === d);
-    if (!day) continue;
-
-    if (completedDayNumbers.has(d)) {
-      tempStreak++;
-      if (tempStreak > bestStreak) bestStreak = tempStreak;
-      if (d <= currentDay) currentStreak = tempStreak;
-    } else if (day.isRecovery) {
-      // Scheduled recovery days do NOT break a streak!
-      continue;
-    } else if (d < currentDay) {
-      tempStreak = 0;
-      currentStreak = 0;
-    }
-  }
+  // Compute streak using deterministic progression service
+  const { currentStreak, bestStreak } = calculateStreak(
+    sessions,
+    formatLocalDate(),
+    settings.bestStreak
+  );
 
   const isTodayCompleted = completedDayNumbers.has(currentDay);
   const isMorningCompleted = settings.completedMorningDays?.includes(currentDay);
   const calendarDate = getDateForDay(settings.challengeStartDate, currentDay);
+
+  const handleObserveRecovery = async () => {
+    const now = new Date();
+    const todayStr = formatLocalDate(now);
+    const session: WorkoutSession = {
+      dayNumber: todayWorkout.dayNumber,
+      dateCompleted: todayStr,
+      startedAt: now.toISOString(),
+      finishedAt: now.toISOString(),
+      totalDurationSeconds: 1200,
+      activeDurationSeconds: 1200,
+      restDurationSeconds: 0,
+      isCompleted: true,
+      sessionType: 'evening',
+      exercises: [],
+      notes: 'Observed scheduled recovery day'
+    };
+
+    try {
+      await db.sessions.add(session);
+      await db.activeWorkout.delete('current');
+
+      const nextDay = advanceProgramDay(todayWorkout.dayNumber, settings.nextPendingDay);
+      const allSessions = await db.sessions.toArray();
+      const streakInfo = calculateStreak(allSessions, todayStr, settings.bestStreak);
+
+      await updateUserSettings({
+        nextPendingDay: nextDay,
+        currentStreak: streakInfo.currentStreak,
+        bestStreak: streakInfo.bestStreak
+      });
+
+      if (onRefreshData) onRefreshData();
+    } catch (err) {
+      console.error('Failed to observe recovery day:', err);
+    }
+  };
 
   return (
     <div className="w-full max-w-6xl mx-auto space-y-6 pb-24 lg:pb-12 animate-fadeIn select-none">
@@ -102,7 +151,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="space-y-4 max-w-xl">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/10 text-xs font-medium text-white/70">
               <Sparkles size={13} className="text-[#a3e635]" />
-              <span>Today's Programmed Session</span>
+              <span>{todayWorkout.isRecovery ? 'Scheduled Recovery Day' : hasPausedWorkout ? 'Workout In Progress (Paused)' : "Today's Programmed Session"}</span>
             </div>
 
             <div>
@@ -138,17 +187,45 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
             {/* Action Buttons */}
             <div className="flex flex-wrap items-center gap-3 pt-2">
-              <button
-                onClick={() => onStartWorkout(currentDay)}
-                className={`flex items-center gap-2.5 px-6 py-3.5 rounded-2xl font-bold text-sm transition-all duration-300 shadow-lg active:scale-95 ${
-                  isTodayCompleted
-                    ? 'bg-white/10 text-white hover:bg-white/20 border border-white/10'
-                    : 'bg-[#a3e635] text-black hover:bg-[#bef264] shadow-[0_0_20px_rgba(163,230,53,0.35)]'
-                }`}
-              >
-                {isTodayCompleted ? <CheckCircle2 size={18} className="text-[#a3e635]" /> : <Play size={18} fill="currentColor" />}
-                <span>{isTodayCompleted ? 'Completed — Train Again' : 'Start Today’s Workout'}</span>
-              </button>
+              {todayWorkout.isRecovery ? (
+                <button
+                  onClick={handleObserveRecovery}
+                  className={`flex items-center gap-2.5 px-6 py-3.5 rounded-2xl font-bold text-sm transition-all duration-300 shadow-lg active:scale-95 ${
+                    isTodayCompleted
+                      ? 'bg-white/10 text-white hover:bg-white/20 border border-white/10'
+                      : 'bg-sky-400 text-black hover:bg-sky-300 shadow-[0_0_20px_rgba(56,189,248,0.35)]'
+                  }`}
+                >
+                  <CheckCircle2 size={18} className={isTodayCompleted ? 'text-sky-400' : 'text-black'} />
+                  <span>{isTodayCompleted ? 'Recovery Day Observed' : 'Mark Recovery Day Observed'}</span>
+                </button>
+              ) : (
+                <button
+                  onClick={() => onStartWorkout(currentDay)}
+                  className={`flex items-center gap-2.5 px-6 py-3.5 rounded-2xl font-bold text-sm transition-all duration-300 shadow-lg active:scale-95 ${
+                    isTodayCompleted
+                      ? 'bg-white/10 text-white hover:bg-white/20 border border-white/10'
+                      : hasPausedWorkout
+                      ? 'bg-amber-400 text-black hover:bg-amber-300 shadow-[0_0_20px_rgba(245,158,11,0.35)]'
+                      : 'bg-[#a3e635] text-black hover:bg-[#bef264] shadow-[0_0_20px_rgba(163,230,53,0.35)]'
+                  }`}
+                >
+                  {isTodayCompleted ? (
+                    <CheckCircle2 size={18} className="text-[#a3e635]" />
+                  ) : hasPausedWorkout ? (
+                    <RotateCcw size={18} />
+                  ) : (
+                    <Play size={18} fill="currentColor" />
+                  )}
+                  <span>
+                    {isTodayCompleted
+                      ? 'Completed — Train Again'
+                      : hasPausedWorkout
+                      ? 'Continue Workout'
+                      : 'Start Today’s Workout'}
+                  </span>
+                </button>
+              )}
 
               <button
                 onClick={() => onNavigate('calendar')}
